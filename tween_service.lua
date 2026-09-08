@@ -98,18 +98,20 @@ function TweenService.tweenTo(target, customSpeed)
     local speed = customSpeed or TweenService.DefaultSpeed
     local char, hum, hrp = getValidCharacter()
 
-    local distance = (target.Position - hrp.Position).Magnitude
-
-    if distance < 50 then
-        TweenService.teleport(target)
-        warn("Teleport")
-        return
-    end
-
     -- ถ้าตัวละครไม่มีอยู่ หรือตายแล้ว ให้ Cancel ทันที
     if not (char and hum and hrp and hum.Health > 0) then
         TweenService.stop()
         return false
+    end
+
+    local distance, err = pcall(function ()
+        return (target.Position - hrp.Position).Magnitude
+    end)
+
+    if distance < 50 then
+        TweenService.teleport(target)
+        -- warn("Teleport")
+        return
     end
 
     local startPos = hrp.Position
