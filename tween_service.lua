@@ -104,13 +104,12 @@ function TweenService.tweenTo(target, customSpeed)
         return false
     end
 
-    local distance, err = pcall(function ()
+    local success, distance = pcall(function ()
         return (target.Position - hrp.Position).Magnitude
     end)
 
-    if distance < 50 then
+    if success and distance < 50 then
         TweenService.teleport(target)
-        -- warn("Teleport")
         return
     end
 
