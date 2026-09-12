@@ -89,6 +89,15 @@ function TweenService.tweenTo(target, customSpeed)
         return false
     end
 
+    local success, distance = pcall(function ()
+        return (target.Position - player.Character:FindFirstChild("HumanoidRootPart").Position).Magnitude
+    end)
+
+    if success and distance < 50 then
+        TweenService.teleport(target)
+        return
+    end
+
     -- ยกเลิก Tween เดิมทันที
     TweenService.stop()
     local mySession = TweenService.CurrentSession
@@ -102,15 +111,6 @@ function TweenService.tweenTo(target, customSpeed)
     if not (char and hum and hrp and hum.Health > 0) then
         TweenService.stop()
         return false
-    end
-
-    local success, distance = pcall(function ()
-        return (target.Position - hrp.Position).Magnitude
-    end)
-
-    if success and distance < 50 then
-        TweenService.teleport(target)
-        return
     end
 
     local startPos = hrp.Position
