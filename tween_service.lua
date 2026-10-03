@@ -74,7 +74,25 @@ end
 
 function TweenService.teleport(target)
     TweenService.stop()
-    player.Character.HumanoidRootPart.CFrame = target
+    local targetCF = typeof(target) == "Vector3" and CFrame.new(target) or target
+    local char, hum, hrp = getValidCharacter()
+    if char and hum and hrp and hum.Health > 0 then
+        local bv = createBodyVelocity(char, hrp)
+        bv:Set(Vector3.zero)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.Velocity = Vector3.zero
+
+        hrp.CFrame = targetCF
+        RunService.Heartbeat:Wait()
+
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.Velocity = Vector3.zero
+        if bv then bv:Destroy() end
+    elseif char and char:FindFirstChild("HumanoidRootPart") then
+        char.HumanoidRootPart.CFrame = targetCF
+    end
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -89,12 +107,21 @@ function TweenService.tweenTo(target, customSpeed)
         return false
     end
 
+    local char, hum, hrp = getValidCharacter()
+
+    -- ถ้าตัวละครไม่มีอยู่ หรือตายแล้ว ให้ Cancel ทันที
+    if not (char and hum and hrp and hum.Health > 0) then
+        TweenService.stop()
+        return false
+    end
+
     local success, distance = pcall(function ()
-        return (target.Position - player.Character:FindFirstChild("HumanoidRootPart").Position).Magnitude
+        return (targetCF.Position - hrp.Position).Magnitude
     end)
 
+    -- เงื่อนไขระยะใกล้ (< 50 studs): ถ้าตรงเงื่อนไขให้ใช้ teleport (ซึ่งมีระบบ BodyMover และล้าง Velocity ภายใน)
     if success and distance < 50 then
-        TweenService.teleport(target)
+        TweenService.teleport(targetCF)
         return
     end
 
@@ -105,13 +132,6 @@ function TweenService.tweenTo(target, customSpeed)
     getgenv().isTweening = true
 
     local speed = customSpeed or TweenService.DefaultSpeed
-    local char, hum, hrp = getValidCharacter()
-
-    -- ถ้าตัวละครไม่มีอยู่ หรือตายแล้ว ให้ Cancel ทันที
-    if not (char and hum and hrp and hum.Health > 0) then
-        TweenService.stop()
-        return false
-    end
 
     local startPos = hrp.Position
     local targetPos = targetCF.Position
@@ -121,6 +141,7 @@ function TweenService.tweenTo(target, customSpeed)
     if totalDist <= 3 then
         hrp.CFrame = targetCF
         hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
         hrp.Velocity = Vector3.zero
         TweenService.IsTweening = false
         getgenv().isTweening = false
@@ -161,12 +182,15 @@ function TweenService.tweenTo(target, customSpeed)
 
     diedConn = hum.Died:Connect(cleanupDied)
 
+    local initialDelta = targetPos - startPos
+    local initialDir = initialDelta.Magnitude > 0 and initialDelta.Unit or Vector3.new(0, 1, 0)
+
     local t0 = os.clock()
     local timeout = math.max((totalDist / speed) * 2.5, 25)
 
-    -- 6. Direct Flight Loop (บินตรงสู่เป้าหมาย ไม่ผ่าน Sky-Arc, ไม่ชะลอความเร็ว, ไม่หมุนหน้า)
+    -- 6. Direct Flight Loop (ดึงค่า dt จริงมาคำนวณ maxStep ป้องกันการพุ่งข้ามเป้าหมายเมื่อ FPS ต่ำ)
     while not charDied and (mySession == TweenService.CurrentSession) and (os.clock() - t0 < timeout) do
-        RunService.Heartbeat:Wait()
+        local dt = RunService.Heartbeat:Wait()
 
         if hum.Health <= 0 then
             cleanupDied()
@@ -177,18 +201,25 @@ function TweenService.tweenTo(target, customSpeed)
         local delta = targetPos - curPos
         local dist = delta.Magnitude
 
-        if dist <= 3.0 then
+        -- ดึง dt จริงมาคำนวณระยะก้าวสูงสุดของเฟรมนี้: local maxStep = speed * dt
+        local maxStep = speed * dt
+
+        -- ถ้าใกล้มากแล้ว หรือระยะทางที่เหลือจะถึง/เลยเป้าหมายในเฟรมนี้ (dist <= maxStep)
+        if dist <= 3.0 or dist <= maxStep then
             break
         end
 
-        -- บินเต็มสปีด ไม่มีการชะลอความเร็ว
+        -- ตรวจสอบว่าตัวละครบินข้ามจุดหมายไปแล้วหรือไม่ (Dot Product <= 0) ป้องกันการบินย้อนไปมา
+        if delta:Dot(initialDir) <= 0 then
+            break
+        end
+
+        -- บินเต็มสปีด พร้อมจำกัดความเร็วสูงสุดไม่ให้เกิน dist / dt เพื่อป้องกันการพุ่งข้ามเป้าหมาย
         local dir = delta.Unit
-        local flightVel = dir * speed
+        local safeSpeed = math.min(speed, dist / math.max(dt, 0.001))
+        local flightVel = dir * safeSpeed
         bv:Set(flightVel)
     end
-
-    if diedConn then diedConn:Disconnect() end
-    if noclipConn then noclipConn:Disconnect() end
 
     -- ถ้าตัวละครตาย หรือ Session ถูกยกเลิก ให้ Cancel ทันที
     if charDied or hum.Health <= 0 then
@@ -197,13 +228,19 @@ function TweenService.tweenTo(target, customSpeed)
     end
 
     if mySession ~= TweenService.CurrentSession then
+        if diedConn then diedConn:Disconnect() end
+        if noclipConn then noclipConn:Disconnect() end
         if bv then bv:Destroy() end
         if hum then hum.PlatformStand = false end
         return false
     end
 
-    -- 7. Authoritative Drain Phase (0.1 วินาที) ที่จุดหมาย
+    -- 7. Authoritative Drain Phase (0.1 วินาที) ที่จุดหมาย โดยยังคง Noclip ไว้
     bv:Set(Vector3.new())
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    hrp.Velocity = Vector3.zero
+
     local drainStart = os.clock()
     while (os.clock() - drainStart < 0.1) and (mySession == TweenService.CurrentSession) do
         RunService.Heartbeat:Wait()
@@ -212,6 +249,9 @@ function TweenService.tweenTo(target, customSpeed)
             return false
         end
         hrp.CFrame = targetCF
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.Velocity = Vector3.zero
         bv:Set(Vector3.new())
     end
 
@@ -223,9 +263,17 @@ function TweenService.tweenTo(target, customSpeed)
 
     if bv then bv:Destroy() end
 
+    -- ปิด Noclip และ Died Listener หลังจากคืนค่าสถานะเรียบร้อยแล้ว
+    if noclipConn then noclipConn:Disconnect() end
+    if diedConn then diedConn:Disconnect() end
+
     TweenService.IsTweening = false
     getgenv().isTweening = false
     return true
 end
+
+-- while task.wait() do
+TweenService.tweenTo(CFrame.new(3031.66845703125, 2280.943359375, -7324.7822265625))
+-- end
 
 return TweenService
