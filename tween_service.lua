@@ -1,13 +1,3 @@
---[[
-    Blox Fruits - Light Fruit Physics Tween Engine
-    ขับเคลื่อนด้วยฟิสิกส์แท้ (BodyVelocity / Util.BodyMover) ตามแบบผลแสง (Light Fruit)
-    
-    คุณสมบัติ:
-    - บินตรงสู่เป้าหมายด้วยความเร็วเต็มสปีด (Direct Flight)
-    - ปิดการทำงานของ BodyGyro และการปรับมุมกล้อง
-    - หากตัวละครตาย ระบบจะ Cancel การ Tween ทันที
-]]
-
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
@@ -271,9 +261,5 @@ function TweenService.tweenTo(target, customSpeed)
     getgenv().isTweening = false
     return true
 end
-
--- while task.wait() do
-TweenService.tweenTo(CFrame.new(3031.66845703125, 2280.943359375, -7324.7822265625))
--- end
 
 return TweenService
