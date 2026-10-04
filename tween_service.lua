@@ -62,7 +62,15 @@ local function createBodyVelocity(char, hrp)
     return bvWrapper
 end
 
-function TweenService.teleport(target)
+function TweenService.teleport(...)
+    local args = {...}
+    local target
+    if args[1] == TweenService then
+        target = args[2]
+    else
+        target = args[1]
+    end
+
     TweenService.stop()
     local targetCF = typeof(target) == "Vector3" and CFrame.new(target) or target
     local char, hum, hrp = getValidCharacter()
@@ -89,8 +97,19 @@ end
 -- ฟังก์ชันหลัก: tweenTo(target, customSpeed)
 -- target: CFrame หรือ Vector3
 -- customSpeed: (ตัวเลือก) ความเร็วที่ต้องการ (ค่าเริ่มต้น 190)
+-- รองรับการเรียกใช้ทั้งแบบ Method (:) และแบบ Function (.)
 -- ════════════════════════════════════════════════════════════
-function TweenService.tweenTo(target, customSpeed)
+function TweenService.tweenTo(...)
+    local args = {...}
+    local target, customSpeed
+    if args[1] == TweenService then
+        target = args[2]
+        customSpeed = args[3]
+    else
+        target = args[1]
+        customSpeed = args[2]
+    end
+
     local targetCF = typeof(target) == "Vector3" and CFrame.new(target) or target
     if typeof(targetCF) ~= "CFrame" then
         -- warn("[TweenService] target ต้องเป็น CFrame หรือ Vector3!")
@@ -269,7 +288,12 @@ end
 -- ════════════════════════════════════════════════════════════
 function TweenService.noclipBoatAndCharacter(...)
     local args = {...}
-    local boat = (args[1] == TweenService) and args[2] or args[1]
+    local boat
+    if args[1] == TweenService then
+        boat = args[2]
+    else
+        boat = args[1]
+    end
 
     local char = player.Character
     if char and char.Parent then
@@ -279,7 +303,7 @@ function TweenService.noclipBoatAndCharacter(...)
             end
         end
     end
-    if boat and boat.Parent then
+    if boat and typeof(boat) == "Instance" and boat.Parent then
         for _, part in ipairs(boat:GetDescendants()) do
             if part:IsA("BasePart") and part.CanCollide then
                 part.CanCollide = false
@@ -295,9 +319,16 @@ end
 -- ════════════════════════════════════════════════════════════
 function TweenService.stopBoat(...)
     local args = {...}
-    local boat = (args[1] == TweenService) and args[2] or args[1]
+    local boat
+    if args[1] == TweenService then
+        boat = args[2]
+    else
+        boat = args[1]
+    end
 
-    local seat = boat and boat:FindFirstChild("VehicleSeat")
+    if not boat or typeof(boat) ~= "Instance" then return end
+
+    local seat = boat:FindFirstChild("VehicleSeat")
     if seat then
         local defaultBV = seat:FindFirstChild("BodyVelocity")
         if defaultBV then
@@ -327,12 +358,6 @@ function TweenService.stopBoat(...)
     end
 end
 
--- ════════════════════════════════════════════════════════════
--- ฟังก์ชันสำหรับเรือ: cruiseBoatForMirage
--- ขับเคลื่อนเรือวนหาเกาะ Mirage แบบต่อเนื่องสมูท (Continuous Cruise)
--- รองรับการเรียกใช้ทั้งแบบ Method (:) และแบบ Function (.)
--- พารามิเตอร์: boat, direction, speed, center, targetY, shouldStopCallback
--- ════════════════════════════════════════════════════════════
 function TweenService.cruiseBoatForMirage(...)
     local args = {...}
     local boat, direction, speed, center, targetY, shouldStop
@@ -352,7 +377,9 @@ function TweenService.cruiseBoatForMirage(...)
         shouldStop = args[6]
     end
 
-    local seat = boat and boat:FindFirstChild("VehicleSeat")
+    if not boat or typeof(boat) ~= "Instance" then return end
+
+    local seat = boat:FindFirstChild("VehicleSeat")
     local char = player.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not seat or not hum or not hum.Sit then return end
