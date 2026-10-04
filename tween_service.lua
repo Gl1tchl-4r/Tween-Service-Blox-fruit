@@ -262,4 +262,204 @@ function TweenService.tweenTo(target, customSpeed)
     return true
 end
 
+-- ════════════════════════════════════════════════════════════
+-- ฟังก์ชันสำหรับเรือ: noclipBoatAndCharacter
+-- ปิด CanCollide ทุกชิ้นส่วนของเรือและตัวละคร ป้องกันการติดหินหรือสิ่งกีดขวาง
+-- รองรับการเรียกใช้ทั้งแบบ Method (:) และแบบ Function (.)
+-- ════════════════════════════════════════════════════════════
+function TweenService.noclipBoatAndCharacter(...)
+    local args = {...}
+    local boat = (args[1] == TweenService) and args[2] or args[1]
+
+    local char = player.Character
+    if char and char.Parent then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+    if boat and boat.Parent then
+        for _, part in ipairs(boat:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- ฟังก์ชันสำหรับเรือ: stopBoat
+-- หยุดแรงขับเคลื่อนของเรืออย่างปลอดภัย ล้าง Velocity และคืนค่าฟิสิกส์เดิม
+-- รองรับการเรียกใช้ทั้งแบบ Method (:) และแบบ Function (.)
+-- ════════════════════════════════════════════════════════════
+function TweenService.stopBoat(...)
+    local args = {...}
+    local boat = (args[1] == TweenService) and args[2] or args[1]
+
+    local seat = boat and boat:FindFirstChild("VehicleSeat")
+    if seat then
+        local defaultBV = seat:FindFirstChild("BodyVelocity")
+        if defaultBV then
+            pcall(function()
+                defaultBV.MaxForce = Vector3.new(589340032, 0, 589340032)
+                defaultBV.Velocity = Vector3.zero
+            end)
+        end
+        local defaultBP = seat:FindFirstChild("BodyPosition")
+        if defaultBP then
+            pcall(function()
+                defaultBP.MaxForce = Vector3.new(0, 589340032, 0)
+            end)
+        end
+        local defaultBG = seat:FindFirstChild("BodyGyro")
+        if defaultBG then
+            pcall(function()
+                defaultBG.MaxTorque = Vector3.new(589340032, 589340032, 589340032)
+                defaultBG.CFrame = seat.CFrame
+            end)
+        end
+        pcall(function()
+            seat.AssemblyLinearVelocity = Vector3.zero
+            seat.AssemblyAngularVelocity = Vector3.zero
+            seat.Velocity = Vector3.zero
+        end)
+    end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- ฟังก์ชันสำหรับเรือ: cruiseBoatForMirage
+-- ขับเคลื่อนเรือวนหาเกาะ Mirage แบบต่อเนื่องสมูท (Continuous Cruise)
+-- รองรับการเรียกใช้ทั้งแบบ Method (:) และแบบ Function (.)
+-- พารามิเตอร์: boat, direction, speed, center, targetY, shouldStopCallback
+-- ════════════════════════════════════════════════════════════
+function TweenService.cruiseBoatForMirage(...)
+    local args = {...}
+    local boat, direction, speed, center, targetY, shouldStop
+    if args[1] == TweenService then
+        boat = args[2]
+        direction = args[3]
+        speed = args[4]
+        center = args[5]
+        targetY = args[6]
+        shouldStop = args[7]
+    else
+        boat = args[1]
+        direction = args[2]
+        speed = args[3]
+        center = args[4]
+        targetY = args[5]
+        shouldStop = args[6]
+    end
+
+    local seat = boat and boat:FindFirstChild("VehicleSeat")
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not seat or not hum or not hum.Sit then return end
+
+    -- Concurrency control ผ่าน Session
+    TweenService.stop()
+    local mySession = TweenService.CurrentSession
+    TweenService.IsTweening = true
+    getgenv().isTweening = true
+
+    -- ค่าพารามิเตอร์ศูนย์กลาง, ความสูง, และความเร็ว
+    local centerPos = Vector3.new(-6122.65576171875, 16.447032928466797, -2250.19921875)
+    if typeof(center) == "CFrame" then
+        centerPos = center.Position
+    elseif typeof(center) == "Vector3" then
+        centerPos = center
+    end
+
+    local heightY = targetY or 150
+    local radius = 40000
+    local dir = (direction == -1) and -1 or 1
+
+    local gameMaxSpeed = (seat:IsA("VehicleSeat") and seat.MaxSpeed) or 0
+    local boatSpeed = math.max(speed or TweenService.DefaultSpeed or 190, gameMaxSpeed)
+    if seat:IsA("VehicleSeat") and seat.MaxSpeed < boatSpeed then
+        pcall(function() seat.MaxSpeed = boatSpeed end)
+    end
+
+    -- ปิดฟิสิกส์เดิมของเกม เพื่อไม่ให้หน่วงหรือโยกเยก
+    local defaultBV = seat:FindFirstChild("BodyVelocity")
+    if defaultBV then pcall(function() defaultBV.MaxForce = Vector3.zero end) end
+    local defaultBP = seat:FindFirstChild("BodyPosition")
+    if defaultBP then pcall(function() defaultBP.MaxForce = Vector3.zero end) end
+    local defaultBG = seat:FindFirstChild("BodyGyro")
+    if defaultBG then pcall(function() defaultBG.MaxTorque = Vector3.zero end) end
+
+    -- Noclip แบบต่อเนื่องทั้งตัวละครและเรือ
+    local noclipConn = RunService.Stepped:Connect(function()
+        TweenService.noclipBoatAndCharacter(boat)
+    end)
+
+    local initialCirclePos = Vector3.new(centerPos.X + radius, heightY, centerPos.Z)
+    local startDist = Vector3.new(seat.Position.X - centerPos.X, 0, seat.Position.Z - centerPos.Z).Magnitude
+    local hasReachedCircle = (startDist >= radius - 500)
+    local currentAngleRad = hasReachedCircle and math.atan2(seat.Position.Z - centerPos.Z, seat.Position.X - centerPos.X) or 0
+
+    local mapFolder = Workspace:FindFirstChild("Map")
+    local locationsFolder = Workspace:FindFirstChild("_WorldOrigin") and Workspace._WorldOrigin:FindFirstChild("Locations")
+
+    while (mySession == TweenService.CurrentSession) do
+        local dt = RunService.Heartbeat:Wait()
+
+        if not hum or hum.Health <= 0 or not hum.Sit then break end
+        if shouldStop and shouldStop() then break end
+
+        -- ตรวจสอบการเกิดของเกาะ Mirage หรือ MysticIsland
+        local mysticIsland = mapFolder and mapFolder:FindFirstChild("MysticIsland")
+        local hasMirageLoc = locationsFolder and locationsFolder:FindFirstChild("Mirage Island", true)
+        if mysticIsland or hasMirageLoc or player:GetAttribute("ExactLocation") == "Mirage Island" then
+            break
+        end
+
+        local nextPos, headingDir
+        local step = boatSpeed * dt
+
+        if not hasReachedCircle then
+            -- [ช่วงที่ 1 - มุ่งหน้าสู่รัศมีวงกลม]: บินตรงไปยังจุดเริ่มต้น (angle = 0) เต็มสปีด
+            local delta = initialCirclePos - seat.Position
+            if delta.Magnitude <= step then
+                nextPos = initialCirclePos
+                hasReachedCircle = true
+                currentAngleRad = 0
+            else
+                nextPos = seat.Position + delta.Unit * step
+            end
+            local horiz = Vector3.new(delta.X, 0, delta.Z)
+            headingDir = (horiz.Magnitude > 0) and horiz.Unit or Vector3.new(seat.CFrame.LookVector.X, 0, seat.CFrame.LookVector.Z).Unit
+        else
+            -- [ช่วงที่ 2 - แล่นวนรอบวงกลม]: กวาดมุมตามความเร็วเต็มสปีดเท่ากับช่วงที่ 1
+            local dAngleRad = (boatSpeed * dt / radius) * dir
+            currentAngleRad = currentAngleRad + dAngleRad
+
+            local targetX = centerPos.X + radius * math.cos(currentAngleRad)
+            local targetZ = centerPos.Z + radius * math.sin(currentAngleRad)
+            nextPos = Vector3.new(targetX, heightY, targetZ)
+
+            headingDir = Vector3.new(
+                -math.sin(currentAngleRad) * dir,
+                0,
+                math.cos(currentAngleRad) * dir
+            ).Unit
+        end
+
+        -- ปรับระดับความสูงแกน Y อย่างนุ่มนวล
+        local yDiff = math.abs(seat.Position.Y - heightY)
+        local nextY = (yDiff < 1) and heightY or (seat.Position.Y + math.sign(heightY - seat.Position.Y) * math.min(yDiff, 150 * dt))
+        nextPos = Vector3.new(nextPos.X, nextY, nextPos.Z)
+
+        seat.CFrame = CFrame.lookAt(nextPos, nextPos + headingDir)
+        seat.AssemblyLinearVelocity = headingDir * boatSpeed
+        seat.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    if noclipConn then noclipConn:Disconnect() end
+    TweenService.stopBoat(boat)
+    TweenService.IsTweening = false
+    getgenv().isTweening = false
+end
+
 return TweenService
