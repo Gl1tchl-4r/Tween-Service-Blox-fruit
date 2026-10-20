@@ -353,8 +353,8 @@ function Tween.trackTo(...)
     if not part then
         return fail("trackTo: subject must be a Model/BasePart with a BasePart")
     end
-    if not part:IsDescendantOf(Workspace) then
-        return fail("trackTo: subject is not in Workspace")
+    if not part:IsDescendantOf(game) then
+        return fail("trackTo: subject has been destroyed")
     end
     if part:IsDescendantOf(char) then
         return fail("trackTo: subject cannot be your own character")
@@ -368,7 +368,7 @@ function Tween.trackTo(...)
         update = function(dt, _, _, root)
             -- อ่านตำแหน่งจริงของ subject ใหม่ทุกเฟรม
             local target = resolvePart(subject)
-            if not target or not target:IsDescendantOf(Workspace) then
+            if not target or not target:IsDescendantOf(game) then
                 return false, newHold(root.Position, root)
             end
 
