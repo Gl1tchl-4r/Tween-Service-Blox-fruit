@@ -1,303 +1,396 @@
+--[[
+    tween_service.lua (rewrite)
+
+    แนวคิด: ตัวขับเคลื่อนเดียว (single driver) + state เดียว
+      state = nil                 -> idle (ไม่มี connection)
+      state = tween / track / boat -> กำลังเคลื่อนที่ (IsTweening = true)
+      state = hold                -> ถึงเป้าแล้ว ตรึงตำแหน่ง (แทน hover)
+
+    API
+      Tween.tweenTo(target, speed?)        blocking, คืน true เมื่อถึง / false, reason
+      Tween.teleport(target)               ย้ายทันที แล้ว hold
+      Tween.trackTo(subject, opts?)        non-blocking, opts = {offset = Vector3, speed = number}
+      Tween.stop()                         ยกเลิกทุกอย่าง กลับ idle
+      Tween.noclipBoatAndCharacter(boat)
+      Tween.stopBoat(boat)
+      Tween.cruiseBoatForMirage(boat, direction, speed, center, targetY, shouldStop)
+
+    target = Vector3 หรือ CFrame | subject = Model หรือ BasePart
+    เรียกได้ทั้ง Tween.func(...) และ Tween:func(...)
+]]
+
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
-local TweenService = {}
-TweenService.DefaultSpeed = 190
-TweenService.NearDistance = 50 -- ใกล้กว่านี้ไม่บิน ใช้ teleport แทน
-TweenService.IsTweening = false -- true เฉพาะตอนกำลังบิน
-TweenService.CurrentSession = 0
+local Tween = {}
+Tween.DefaultSpeed = 190
+Tween.MaxSpeed = 1000
+Tween.Noclip = true  -- ปิดชนตัวละคร (และเรือตอน cruise) ระหว่างมี state
+Tween.Debug = false  -- true = warn เหตุผลที่ method ปฏิเสธ
+Tween.IsTweening = false -- true เฉพาะตอนเคลื่อนที่ (ไม่รวม hold)
 
--- ดึง Util.BodyMover ของเกม Blox Fruits
-local Util = nil
-pcall(function()
-    Util = require(ReplicatedStorage:WaitForChild("Util", 5))
-end)
+local MAX_DT = 0.1 -- จำกัดก้าวต่อเฟรม กันพุ่งตอนแล็ก
+local DEFAULT_MIRAGE_CENTER = Vector3.new(-6122.65576171875, 16.447032928466797, -2250.19921875)
+
+-- ════════════════════════════════════════════════════════════
+-- กันรันซ้ำ: ถ้าสคริปต์ถูก execute อีกรอบ ให้ปลด driver ตัวเก่าก่อน
+-- ════════════════════════════════════════════════════════════
+local generation = (tonumber(env.__TweenGen) or 0) + 1
+env.__TweenGen = generation
+if env.__TweenDriverConn then
+    pcall(function() env.__TweenDriverConn:Disconnect() end)
+    env.__TweenDriverConn = nil
+end
 
 -- ════════════════════════════════════════════════════════════
 -- Helpers
 -- ════════════════════════════════════════════════════════════
+local function warnf(...)
+    if Tween.Debug then warn("[Tween]", ...) end
+end
 
-local function setTweening(state)
-    TweenService.IsTweening = state
-    env.isTweening = state
+local function fail(reason)
+    warnf(reason)
+    return false, reason
 end
 
 -- รองรับทั้ง Tween.func(...) และ Tween:func(...)
 local function unpackArgs(...)
     local first = ...
-    if first == TweenService then
+    if first == Tween then
         return select(2, ...)
     end
     return ...
 end
 
-local function toCFrame(target)
-    if typeof(target) == "CFrame" then return target end
-    if typeof(target) == "Vector3" then return CFrame.new(target) end
+local function isFinite(n)
+    return type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge
+end
+
+local function validVector(v)
+    return typeof(v) == "Vector3" and isFinite(v.X) and isFinite(v.Y) and isFinite(v.Z)
+end
+
+-- คืน (position, cframe หรือ nil) | nil ถ้าไม่ถูกต้อง
+local function parseTarget(target)
+    if typeof(target) == "CFrame" then
+        if validVector(target.Position) then
+            return target.Position, target
+        end
+    elseif validVector(target) then
+        return target, nil
+    end
     return nil
 end
 
-local function getValidCharacter()
-    local char = player.Character
-    local hum = char and char:FindFirstChild("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+local function parseSpeed(speed)
+    if speed == nil then return Tween.DefaultSpeed end
+    if isFinite(speed) and speed > 0 then
+        return math.min(speed, Tween.MaxSpeed)
+    end
+    warnf("invalid speed, using default")
+    return Tween.DefaultSpeed
+end
 
-    if char and hum and hrp and hum.Health > 0 and hrp.Parent then
+local function getCharacter()
+    local char = player.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hum and hrp and hrp:IsA("BasePart") and hrp.Parent and hum.Health > 0 then
         return char, hum, hrp
     end
-    return nil, nil, nil
+    return nil
 end
 
 local function zeroVelocity(hrp)
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
-    hrp.Velocity = Vector3.zero
 end
 
--- เก็บ BasePart ครั้งเดียว แล้วใช้ซ้ำใน Stepped (ไม่วน GetDescendants ทุกเฟรม)
-local function collectParts(list, ...)
-    for i = 1, select("#", ...) do
-        local root = select(i, ...)
-        if root then
-            for _, p in ipairs(root:GetDescendants()) do
-                if p:IsA("BasePart") and p.Name ~= "_SafeLandingPad" then
-                    list[#list + 1] = p
-                end
+-- เปลี่ยนเฉพาะตำแหน่ง คง orientation เดิมไว้
+local function setPos(hrp, pos)
+    hrp.CFrame = CFrame.new(pos) * hrp.CFrame.Rotation
+end
+
+local function collectParts(list, root)
+    if root then
+        for _, p in ipairs(root:GetDescendants()) do
+            if p:IsA("BasePart") and p.Name ~= "_SafeLandingPad" then
+                list[#list + 1] = p
             end
         end
     end
     return list
 end
 
-local function connectNoclip(parts)
-    return RunService.Stepped:Connect(function()
-        for i = 1, #parts do
-            parts[i].CanCollide = false
-        end
-    end)
+-- resolve subject (Model/BasePart) -> BasePart หรือ nil
+local function resolvePart(subject)
+    if typeof(subject) ~= "Instance" then return nil end
+    if subject:IsA("BasePart") then return subject end
+    if subject:IsA("Model") then
+        return subject.PrimaryPart
+            or subject:FindFirstChild("HumanoidRootPart")
+            or subject:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return nil
 end
 
--- สร้าง BodyVelocity (ใช้ Util.BodyMover ของเกมถ้ามี ไม่งั้นใช้ของ Roblox ตรงๆ)
-local function createBodyVelocity(char, hrp)
-    if Util and Util.BodyMover then
-        local ok, wrapper = pcall(function()
-            local bm = Util.BodyMover.new(char)
-            return bm:Create("BodyVelocity", { Velocity = Vector3.zero })
-        end)
-        if ok and wrapper then
-            return wrapper
+-- ════════════════════════════════════════════════════════════
+-- Driver
+-- ════════════════════════════════════════════════════════════
+local state = nil
+local conn = nil
+local onStep -- forward declaration
+
+-- noclip: cache parts ของตัวละครครั้งเดียวต่อ character (Humanoid คืนค่า CanCollide เองเมื่อเราหยุด)
+local cachedChar = nil
+local charParts = {}
+
+local function applyNoclip(char, extraParts)
+    if cachedChar ~= char then
+        cachedChar = char
+        charParts = collectParts({}, char)
+    end
+    for i = 1, #charParts do
+        charParts[i].CanCollide = false
+    end
+    if extraParts then
+        for i = 1, #extraParts do
+            extraParts[i].CanCollide = false
         end
     end
+end
 
-    local nativeBv = Instance.new("BodyVelocity")
-    nativeBv.Name = "LightFlightBV"
-    nativeBv.MaxForce = Vector3.new(300000, 300000, 300000)
-    nativeBv.P = 15000
-    nativeBv.Velocity = Vector3.zero
-    nativeBv.Parent = hrp
+local function ensureDriver()
+    if conn then return end
+    conn = RunService.PreSimulation:Connect(function(dt)
+        onStep(dt)
+    end)
+    env.__TweenDriverConn = conn
+end
 
+local function dropDriver()
+    if conn then
+        conn:Disconnect()
+        conn = nil
+        env.__TweenDriverConn = nil
+    end
+end
+
+local function finish(st, ok, reason)
+    if st.done then return end
+    st.done = true
+    st.ok = ok == true
+    st.reason = reason
+    if st.onEnd then
+        local success, err = pcall(st.onEnd)
+        if not success then warnf("onEnd error:", err) end
+    end
+end
+
+-- เปลี่ยน state: state เก่าถูกปิด (ok/reason บอกผลของมัน) แล้วเริ่มอันใหม่
+local function replaceState(newState, oldOk, oldReason)
+    local old = state
+    state = newState
+    if old then
+        finish(old, oldOk, oldReason or "cancelled")
+    end
+
+    local moving = (newState ~= nil and newState.moving == true)
+    Tween.IsTweening = moving
+    env.isTweening = moving
+
+    if newState then ensureDriver() else dropDriver() end
+end
+
+local function newHold(pos, owner)
     return {
-        Set = function(_, vel) nativeBv.Velocity = vel end,
-        Destroy = function(_) nativeBv:Destroy() end,
+        moving = false,
+        owner = owner,
+        update = function(dt, char, hum, hrp)
+            setPos(hrp, pos)
+            zeroVelocity(hrp)
+        end,
     }
 end
 
--- ════════════════════════════════════════════════════════════
--- Hover (ภายใน): BodyVelocity ความเร็วศูนย์ค้างไว้ที่ตัวละคร
--- ตั้งอัตโนมัติเมื่อ tweenTo/teleport ถึงเป้า กันฟิสิกส์ดึงตัวละครลง
--- ปลดเมื่อ: tweenTo รอบถัดไปต้องบิน, เรียก stop()/releaseHover()
--- ════════════════════════════════════════════════════════════
-local hover = nil -- { bv = wrapper, hrp = HumanoidRootPart }
-
-local function releaseHover()
-    if hover then
-        local bv = hover.bv
-        hover = nil
-        pcall(function() bv:Destroy() end)
-    end
-end
-
-local function engageHover(char, hrp)
-    if hover and hover.hrp == hrp and hrp.Parent then
-        pcall(function() hover.bv:Set(Vector3.zero) end) -- มีอยู่แล้ว ไม่สร้างซ้ำ
+onStep = function(dt)
+    local st = state
+    if not st then
+        dropDriver()
         return
     end
-    releaseHover() -- ตัวเก่าของตัวละครก่อนหน้า (รีสปอว์น)
 
-    local bv = createBodyVelocity(char, hrp)
-    bv:Set(Vector3.zero)
-    hover = { bv = bv, hrp = hrp }
-end
+    local char, hum, hrp = getCharacter()
+    if not char or hrp ~= st.owner then
+        replaceState(nil, false, "character unavailable")
+        return
+    end
 
--- ════════════════════════════════════════════════════════════
--- Session control
--- ════════════════════════════════════════════════════════════
-local flightBV = nil
+    if Tween.Noclip then
+        applyNoclip(char, st.extraParts)
+    end
 
--- ยกเลิกการบินที่ค้างอยู่ (ไม่แตะ hover)
-local function cancelTween()
-    TweenService.CurrentSession += 1
-    setTweening(false)
-    -- เบรกเธรดบินเก่าทันที ไม่รอให้มันตื่นมา cleanup เอง (กันลอยเลยเป้าอีก 1 เฟรม)
-    if flightBV then
-        local bv = flightBV
-        pcall(function() bv:Set(Vector3.zero) end)
+    local ok, status, nextState = pcall(st.update, math.min(dt, MAX_DT), char, hum, hrp)
+    if not ok then
+        warn("[Tween] update error:", status)
+        replaceState(nil, false, "internal error")
+        return
+    end
+
+    -- status: nil = ทำต่อ | true = สำเร็จ | false = ล้มเหลว (nextState = state ถัดไป หรือ nil)
+    if status ~= nil then
+        replaceState(nextState, status, status and nil or "lost target")
     end
 end
 
--- หยุดทุกอย่าง: ยกเลิกการบิน + ปลด hover
-function TweenService.stop()
-    cancelTween()
-    releaseHover()
-end
-
-function TweenService.releaseHover()
-    releaseHover()
+local function waitFor(st)
+    while not st.done do
+        if env.__TweenGen ~= generation then
+            return false, "module reloaded"
+        end
+        RunService.Heartbeat:Wait()
+    end
+    if st.ok then return true end
+    return false, st.reason or "cancelled"
 end
 
 -- ════════════════════════════════════════════════════════════
--- teleport: วาร์ปทันที แล้ว hover ที่จุดหมาย
+-- Public: stop / teleport / tweenTo / trackTo
 -- ════════════════════════════════════════════════════════════
-function TweenService.teleport(...)
+function Tween.stop()
+    replaceState(nil, false, "stopped")
+end
+
+function Tween.teleport(...)
     local target = unpackArgs(...)
-    local targetCF = toCFrame(target)
-    if not targetCF then return false end
-
-    cancelTween()
-
-    local char, hum, hrp = getValidCharacter()
-    if not char then
-        releaseHover()
-        return false
+    local pos, cf = parseTarget(target)
+    if not pos then
+        return fail("teleport: target must be a finite Vector3 or CFrame")
     end
 
-    engageHover(char, hrp)
-    hrp.CFrame = targetCF
-    zeroVelocity(hrp)
+    local char, hum, hrp = getCharacter()
+    if not char then
+        replaceState(nil, false, "character unavailable")
+        return fail("teleport: character not ready")
+    end
 
-    RunService.Heartbeat:Wait()
-    if hrp.Parent then zeroVelocity(hrp) end
+    hrp.CFrame = cf or (CFrame.new(pos) * hrp.CFrame.Rotation)
+    zeroVelocity(hrp)
+    replaceState(newHold(pos, hrp), false)
     return true
 end
 
--- ════════════════════════════════════════════════════════════
--- tweenTo(target, customSpeed)
--- target: CFrame หรือ Vector3
--- customSpeed: (ตัวเลือก) ค่าเริ่มต้น = DefaultSpeed
--- - ใกล้กว่า NearDistance: teleport
--- - ไกล: บินด้วย BodyVelocity + noclip (block จนถึง)
--- ถึงเป้าแล้วจะ hover ค้างไว้เอง คืน true เมื่อถึง, false เมื่อไม่สำเร็จ
--- ════════════════════════════════════════════════════════════
-function TweenService.tweenTo(...)
+function Tween.tweenTo(...)
     local target, customSpeed = unpackArgs(...)
-    local targetCF = toCFrame(target)
-    if not targetCF then return false end
+    local goal, goalCF = parseTarget(target)
+    if not goal then
+        return fail("tweenTo: target must be a finite Vector3 or CFrame")
+    end
 
-    local char, hum, hrp = getValidCharacter()
+    local char, hum, hrp = getCharacter()
     if not char then
-        TweenService.stop()
-        return false
+        replaceState(nil, false, "character unavailable")
+        return fail("tweenTo: character not ready")
     end
 
-    local startPos = hrp.Position
-    local targetPos = targetCF.Position
-    local totalDist = (targetPos - startPos).Magnitude
+    local speed = parseSpeed(customSpeed)
 
-    if totalDist < TweenService.NearDistance then
-        return TweenService.teleport(targetCF)
+    local st = {
+        moving = true,
+        owner = hrp,
+        update = function(dt, _, _, root)
+            local pos = root.Position
+            local delta = goal - pos
+            local dist = delta.Magnitude
+            local step = speed * dt
+
+            if dist <= step then
+                root.CFrame = goalCF or (CFrame.new(goal) * root.CFrame.Rotation)
+                zeroVelocity(root)
+                return true, newHold(goal, root) -- ถึงแล้ว -> hold
+            end
+
+            setPos(root, pos + delta / dist * step)
+            zeroVelocity(root)
+        end,
+    }
+
+    replaceState(st)
+    return waitFor(st)
+end
+
+-- subject: Model/BasePart | opts: { offset = Vector3, speed = number }
+-- non-blocking: ตามต่อไปเรื่อยๆ จนกว่าจะเรียก stop() / คำสั่งอื่น
+-- ถ้า subject หายไป จะ hold ที่ตำแหน่งล่าสุด
+function Tween.trackTo(...)
+    local subject, opts = unpackArgs(...)
+
+    if opts ~= nil and type(opts) ~= "table" then
+        return fail("trackTo: opts must be a table")
+    end
+    opts = opts or {}
+
+    local offset = opts.offset
+    if offset == nil then
+        offset = Vector3.zero
+    elseif not validVector(offset) then
+        return fail("trackTo: offset must be a finite Vector3")
     end
 
-    -- เริ่ม session ใหม่ + ปลด hover (กัน BodyVelocity สองตัวสู้กันระหว่างบิน)
-    cancelTween()
-    releaseHover()
-    local mySession = TweenService.CurrentSession
-    setTweening(true)
-
-    local speed = customSpeed or TweenService.DefaultSpeed
-    local bv = createBodyVelocity(char, hrp)
-    flightBV = bv
-    hum.PlatformStand = true
-    local noclipConn = connectNoclip(collectParts({}, char))
-
-    -- cleanup ปลอดภัยต่อ session: ไม่ทับสถานะของ session ใหม่ที่เข้ามาแทน
-    local function cleanup()
-        noclipConn:Disconnect()
-        bv:Destroy()
-        if flightBV == bv then flightBV = nil end
-
-        local owns = (mySession == TweenService.CurrentSession)
-        if owns then
-            setTweening(false)
-        end
-        if hum.Parent and (owns or not TweenService.IsTweening) then
-            hum.PlatformStand = false
-        end
+    local char, hum, hrp = getCharacter()
+    if not char then
+        replaceState(nil, false, "character unavailable")
+        return fail("trackTo: character not ready")
     end
 
-    local initialDir = (targetPos - startPos).Unit -- totalDist >= NearDistance จึงไม่เป็นศูนย์
-    local t0 = os.clock()
-    local timeout = math.max((totalDist / speed) * 2.5, 25)
-
-    -- Flight loop: ใช้ dt จริงจำกัดก้าวสูงสุด กันพุ่งข้ามเป้าตอน FPS ต่ำ
-    -- (ถ้า timeout จะหลุดลูปแล้วตรึงที่เป้าใน drain phase เหมือนเดิม)
-    while mySession == TweenService.CurrentSession and (os.clock() - t0 < timeout) do
-        local dt = RunService.Heartbeat:Wait()
-
-        if hum.Health <= 0 or not hrp.Parent then
-            cleanup()
-            return false
-        end
-
-        local delta = targetPos - hrp.Position
-        local dist = delta.Magnitude
-
-        -- ถึงแล้ว / ก้าวถัดไปจะถึง / บินเลยเป้าไปแล้ว
-        if dist <= 3 or dist <= speed * dt or delta:Dot(initialDir) <= 0 then
-            break
-        end
-
-        local safeSpeed = math.min(speed, dist / math.max(dt, 0.001))
-        bv:Set(delta.Unit * safeSpeed)
+    local part = resolvePart(subject)
+    if not part then
+        return fail("trackTo: subject must be a Model/BasePart with a BasePart")
+    end
+    if not part:IsDescendantOf(Workspace) then
+        return fail("trackTo: subject is not in Workspace")
+    end
+    if part:IsDescendantOf(char) then
+        return fail("trackTo: subject cannot be your own character")
     end
 
-    if mySession ~= TweenService.CurrentSession then
-        cleanup()
-        return false
-    end
+    local speed = parseSpeed(opts.speed)
 
-    -- Drain phase (0.1 วินาที): ตรึงที่จุดหมายและล้าง velocity โดยยังเปิด noclip
-    bv:Set(Vector3.zero)
-    zeroVelocity(hrp)
+    local st = {
+        moving = true,
+        owner = hrp,
+        update = function(dt, _, _, root)
+            -- อ่านตำแหน่งจริงของ subject ใหม่ทุกเฟรม
+            local target = resolvePart(subject)
+            if not target or not target:IsDescendantOf(Workspace) then
+                return false, newHold(root.Position, root)
+            end
 
-    local drainStart = os.clock()
-    while os.clock() - drainStart < 0.1 and mySession == TweenService.CurrentSession do
-        RunService.Heartbeat:Wait()
-        if hum.Health <= 0 or not hrp.Parent then
-            cleanup()
-            return false
-        end
-        hrp.CFrame = targetCF
-        zeroVelocity(hrp)
-        bv:Set(Vector3.zero)
-    end
+            local tp = target.Position
+            if not validVector(tp) then return end -- ข้ามเฟรมนี้
 
-    -- ถูกยกเลิกระหว่าง drain -> ห้ามรายงานว่าสำเร็จ และห้าม hover ทับ session ใหม่
-    if mySession ~= TweenService.CurrentSession then
-        cleanup()
-        return false
-    end
+            local goal = tp + offset
+            local pos = root.Position
+            local delta = goal - pos
+            local dist = delta.Magnitude
+            local step = speed * dt
 
-    -- ถึงเป้าจริง: คืนสถานะ Humanoid แล้ว hover ค้างไว้ทันที (ไม่มีช่วงว่างให้ตก)
-    cleanup()
-    engageHover(char, hrp)
-    pcall(function()
-        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-    end)
+            if dist <= step then
+                setPos(root, goal)
+            else
+                setPos(root, pos + delta / dist * step)
+            end
+            zeroVelocity(root)
+        end,
+    }
+
+    replaceState(st)
     return true
 end
 
@@ -306,22 +399,23 @@ end
 -- ════════════════════════════════════════════════════════════
 
 -- ปิด CanCollide ของตัวละครและเรือ (ครั้งเดียว)
-function TweenService.noclipBoatAndCharacter(...)
+function Tween.noclipBoatAndCharacter(...)
     local boat = unpackArgs(...)
     local char = player.Character
 
-    local parts = collectParts({},
-        (char and char.Parent) and char or nil,
-        (typeof(boat) == "Instance" and boat.Parent) and boat or nil)
+    local parts = {}
+    if char and char.Parent then collectParts(parts, char) end
+    if typeof(boat) == "Instance" and boat.Parent then collectParts(parts, boat) end
+
     for i = 1, #parts do
         parts[i].CanCollide = false
     end
 end
 
 -- หยุดแรงขับเคลื่อนของเรือและคืนค่าฟิสิกส์เดิม
-function TweenService.stopBoat(...)
+function Tween.stopBoat(...)
     local boat = unpackArgs(...)
-    if not boat or typeof(boat) ~= "Instance" then return end
+    if typeof(boat) ~= "Instance" then return end
 
     local seat = boat:FindFirstChild("VehicleSeat")
     if not seat then return end
@@ -352,51 +446,71 @@ function TweenService.stopBoat(...)
     pcall(function()
         seat.AssemblyLinearVelocity = Vector3.zero
         seat.AssemblyAngularVelocity = Vector3.zero
-        seat.Velocity = Vector3.zero
     end)
 end
 
--- cruiseBoatForMirage(boat, direction, speed, center, targetY, shouldStop)
-function TweenService.cruiseBoatForMirage(...)
-    local boat, direction, speed, center, targetY, shouldStop = unpackArgs(...)
-    if not boat or typeof(boat) ~= "Instance" then return end
-
-    local seat = boat:FindFirstChild("VehicleSeat")
-    local char = player.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not seat or not hum or not hum.Sit then return end
-
-    -- stop() ปลด hover ด้วย (ตัวละครนั่งเรืออยู่ ไม่ควรมี BodyVelocity ค้าง)
-    TweenService.stop()
-    local mySession = TweenService.CurrentSession
-    setTweening(true)
-
-    local centerPos = Vector3.new(-6122.65576171875, 16.447032928466797, -2250.19921875)
-    if typeof(center) == "CFrame" then
-        centerPos = center.Position
-    elseif typeof(center) == "Vector3" then
-        centerPos = center
+local function mirageSpawned()
+    local mapFolder = Workspace:FindFirstChild("Map")
+    if mapFolder and mapFolder:FindFirstChild("MysticIsland") then
+        return true
     end
 
-    local heightY = targetY or 150
+    local worldOrigin = Workspace:FindFirstChild("_WorldOrigin")
+    local locations = worldOrigin and worldOrigin:FindFirstChild("Locations")
+    if locations and locations:FindFirstChild("Mirage Island", true) then
+        return true
+    end
+
+    return player:GetAttribute("ExactLocation") == "Mirage Island"
+end
+
+-- cruiseBoatForMirage(boat, direction, speed, center, targetY, shouldStop)
+-- blocking: คืน true เมื่อจบปกติ (เจอ Mirage / shouldStop) | false, reason เมื่อถูกยกเลิก/ล้มเหลว
+function Tween.cruiseBoatForMirage(...)
+    local boat, direction, speed, center, targetY, shouldStop = unpackArgs(...)
+
+    if typeof(boat) ~= "Instance" or not boat.Parent then
+        return fail("cruiseBoatForMirage: boat is invalid")
+    end
+    local seat = boat:FindFirstChild("VehicleSeat")
+    if not seat or not seat:IsA("BasePart") then
+        return fail("cruiseBoatForMirage: boat has no VehicleSeat")
+    end
+
+    local char, hum, hrp = getCharacter()
+    if not char then
+        replaceState(nil, false, "character unavailable")
+        return fail("cruiseBoatForMirage: character not ready")
+    end
+    if not hum.Sit then
+        return fail("cruiseBoatForMirage: character is not seated")
+    end
+    if shouldStop ~= nil and type(shouldStop) ~= "function" then
+        return fail("cruiseBoatForMirage: shouldStop must be a function")
+    end
+
+    local centerPos = DEFAULT_MIRAGE_CENTER
+    if center ~= nil then
+        local p = parseTarget(center)
+        if not p then
+            return fail("cruiseBoatForMirage: center must be a finite Vector3 or CFrame")
+        end
+        centerPos = p
+    end
+
+    local heightY = 150
+    if targetY ~= nil then
+        if not isFinite(targetY) then
+            return fail("cruiseBoatForMirage: targetY must be a finite number")
+        end
+        heightY = targetY
+    end
+
     local radius = 40000
     local dir = (direction == -1) and -1 or 1
 
     local gameMaxSpeed = (seat:IsA("VehicleSeat") and seat.MaxSpeed) or 0
-    local boatSpeed = math.max(speed or TweenService.DefaultSpeed or 190, gameMaxSpeed)
-    if seat:IsA("VehicleSeat") and seat.MaxSpeed < boatSpeed then
-        pcall(function() seat.MaxSpeed = boatSpeed end)
-    end
-
-    -- ปิดฟิสิกส์เดิมของเกม ไม่ให้หน่วงหรือโยกเยก
-    local defaultBV = seat:FindFirstChild("BodyVelocity")
-    if defaultBV then pcall(function() defaultBV.MaxForce = Vector3.zero end) end
-    local defaultBP = seat:FindFirstChild("BodyPosition")
-    if defaultBP then pcall(function() defaultBP.MaxForce = Vector3.zero end) end
-    local defaultBG = seat:FindFirstChild("BodyGyro")
-    if defaultBG then pcall(function() defaultBG.MaxTorque = Vector3.zero end) end
-
-    local noclipConn = connectNoclip(collectParts({}, char, boat))
+    local boatSpeed = math.max(parseSpeed(speed), gameMaxSpeed)
 
     local initialCirclePos = Vector3.new(centerPos.X + radius, heightY, centerPos.Z)
     local startDist = Vector3.new(seat.Position.X - centerPos.X, 0, seat.Position.Z - centerPos.Z).Magnitude
@@ -405,71 +519,82 @@ function TweenService.cruiseBoatForMirage(...)
         and math.atan2(seat.Position.Z - centerPos.Z, seat.Position.X - centerPos.X)
         or 0
 
-    while mySession == TweenService.CurrentSession do
-        local dt = RunService.Heartbeat:Wait()
-
-        if not hum.Parent or not seat.Parent or hum.Health <= 0 or not hum.Sit then break end
-        if shouldStop and shouldStop() then break end
-
-        -- ตรวจการเกิดของเกาะ Mirage / MysticIsland
-        local mapFolder = Workspace:FindFirstChild("Map")
-        local worldOrigin = Workspace:FindFirstChild("_WorldOrigin")
-        local locationsFolder = worldOrigin and worldOrigin:FindFirstChild("Locations")
-
-        local mysticIsland = mapFolder and mapFolder:FindFirstChild("MysticIsland")
-        local hasMirageLoc = locationsFolder and locationsFolder:FindFirstChild("Mirage Island", true)
-        if mysticIsland or hasMirageLoc or player:GetAttribute("ExactLocation") == "Mirage Island" then
-            break
-        end
-
-        local nextPos, headingDir
-        local step = boatSpeed * dt
-
-        if not hasReachedCircle then
-            -- ช่วงที่ 1: บินตรงไปยังจุดเริ่มวงกลม (angle = 0)
-            local delta = initialCirclePos - seat.Position
-            if delta.Magnitude <= step then
-                nextPos = initialCirclePos
-                hasReachedCircle = true
-                currentAngleRad = 0
-            else
-                nextPos = seat.Position + delta.Unit * step
+    local st = {
+        moving = true,
+        owner = hrp,
+        extraParts = collectParts({}, boat),
+        onEnd = function()
+            Tween.stopBoat(boat) -- คืนฟิสิกส์เรือทุกกรณี (จบปกติ/ถูกยกเลิก/ตัวละครตาย)
+        end,
+        update = function(dt, _, humanoid, _)
+            if not seat.Parent or not humanoid.Sit then
+                return false
             end
-            local horiz = Vector3.new(delta.X, 0, delta.Z)
-            headingDir = (horiz.Magnitude > 0) and horiz.Unit
-                or Vector3.new(seat.CFrame.LookVector.X, 0, seat.CFrame.LookVector.Z).Unit
-        else
-            -- ช่วงที่ 2: แล่นวนรอบวงกลมด้วยความเร็วเท่าเดิม
-            currentAngleRad = currentAngleRad + (boatSpeed * dt / radius) * dir
+            if shouldStop and shouldStop() then
+                return true
+            end
+            if mirageSpawned() then
+                return true
+            end
 
-            nextPos = Vector3.new(
-                centerPos.X + radius * math.cos(currentAngleRad),
-                heightY,
-                centerPos.Z + radius * math.sin(currentAngleRad)
-            )
-            headingDir = Vector3.new(
-                -math.sin(currentAngleRad) * dir,
-                0,
-                math.cos(currentAngleRad) * dir
-            ).Unit
-        end
+            local nextPos, headingDir
+            local step = boatSpeed * dt
 
-        -- ปรับความสูงแกน Y อย่างนุ่มนวล
-        local yDiff = math.abs(seat.Position.Y - heightY)
-        local nextY = (yDiff < 1) and heightY
-            or (seat.Position.Y + math.sign(heightY - seat.Position.Y) * math.min(yDiff, 150 * dt))
-        nextPos = Vector3.new(nextPos.X, nextY, nextPos.Z)
+            if not hasReachedCircle then
+                -- ช่วงที่ 1: บินตรงไปยังจุดเริ่มวงกลม (angle = 0)
+                local delta = initialCirclePos - seat.Position
+                if delta.Magnitude <= step then
+                    nextPos = initialCirclePos
+                    hasReachedCircle = true
+                    currentAngleRad = 0
+                else
+                    nextPos = seat.Position + delta.Unit * step
+                end
+                local horiz = Vector3.new(delta.X, 0, delta.Z)
+                headingDir = (horiz.Magnitude > 0) and horiz.Unit
+                    or Vector3.new(seat.CFrame.LookVector.X, 0, seat.CFrame.LookVector.Z).Unit
+            else
+                -- ช่วงที่ 2: แล่นวนรอบวงกลมด้วยความเร็วเท่าเดิม
+                currentAngleRad = currentAngleRad + (boatSpeed * dt / radius) * dir
 
-        seat.CFrame = CFrame.lookAt(nextPos, nextPos + headingDir)
-        seat.AssemblyLinearVelocity = headingDir * boatSpeed
-        seat.AssemblyAngularVelocity = Vector3.zero
+                nextPos = Vector3.new(
+                    centerPos.X + radius * math.cos(currentAngleRad),
+                    heightY,
+                    centerPos.Z + radius * math.sin(currentAngleRad)
+                )
+                headingDir = Vector3.new(
+                    -math.sin(currentAngleRad) * dir,
+                    0,
+                    math.cos(currentAngleRad) * dir
+                ).Unit
+            end
+
+            -- ปรับความสูงแกน Y อย่างนุ่มนวล
+            local yDiff = math.abs(seat.Position.Y - heightY)
+            local nextY = (yDiff < 1) and heightY
+                or (seat.Position.Y + math.sign(heightY - seat.Position.Y) * math.min(yDiff, 150 * dt))
+            nextPos = Vector3.new(nextPos.X, nextY, nextPos.Z)
+
+            seat.CFrame = CFrame.lookAt(nextPos, nextPos + headingDir)
+            seat.AssemblyLinearVelocity = headingDir * boatSpeed
+            seat.AssemblyAngularVelocity = Vector3.zero
+        end,
+    }
+
+    -- เปลี่ยน state ก่อน แล้วค่อยแก้ฟิสิกส์เรือ (กัน onEnd ของ state เก่าคืนค่าทับ)
+    replaceState(st)
+
+    if seat:IsA("VehicleSeat") and seat.MaxSpeed < boatSpeed then
+        pcall(function() seat.MaxSpeed = boatSpeed end)
     end
+    local defaultBV = seat:FindFirstChild("BodyVelocity")
+    if defaultBV then pcall(function() defaultBV.MaxForce = Vector3.zero end) end
+    local defaultBP = seat:FindFirstChild("BodyPosition")
+    if defaultBP then pcall(function() defaultBP.MaxForce = Vector3.zero end) end
+    local defaultBG = seat:FindFirstChild("BodyGyro")
+    if defaultBG then pcall(function() defaultBG.MaxTorque = Vector3.zero end) end
 
-    noclipConn:Disconnect()
-    TweenService.stopBoat(boat)
-    if mySession == TweenService.CurrentSession then
-        setTweening(false)
-    end
+    return waitFor(st)
 end
 
-return TweenService
+return Tween
