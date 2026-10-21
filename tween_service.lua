@@ -117,6 +117,32 @@ local function setPos(hrp, pos)
     hrp.CFrame = CFrame.new(pos) * hrp.CFrame.Rotation
 end
 
+-- ขยับ "ตำแหน่งเสมือน" (mover.cur) เข้าหา goal ตามความเร็ว แล้วเขียนทับ HRP ทุกเฟรม
+-- ไม่อ่านตำแหน่งจริงมาสะสมต่อ จึงไม่โดนแรงโน้มถ่วงกัดกินความสูงทีละเฟรม
+-- ถ้าตัวละครถูกดึงห่างจากตำแหน่งเสมือนเกิน RESYNC_DISTANCE (เกมวาร์ป/knockback) ให้ sync จากตำแหน่งจริง
+-- คืน true เมื่อถึงเป้า
+local RESYNC_DISTANCE = 10
+
+local function stepToward(mover, root, goal, speed, dt)
+    local actual = root.Position
+    local cur = mover.cur
+    if not cur or (actual - cur).Magnitude > RESYNC_DISTANCE then
+        cur = actual
+    end
+
+    local delta = goal - cur
+    local dist = delta.Magnitude
+    local step = speed * dt
+    local arrived = dist <= step
+
+    cur = arrived and goal or (cur + delta / dist * step)
+    mover.cur = cur
+
+    setPos(root, cur)
+    zeroVelocity(root)
+    return arrived
+end
+
 local function collectParts(list, root)
     if root then
         for _, p in ipairs(root:GetDescendants()) do
@@ -301,23 +327,16 @@ function Tween.tweenTo(...)
 
     local speed = parseSpeed(customSpeed)
 
+    local mover = {}
     local st = {
         moving = true,
         owner = hrp,
         update = function(dt, _, _, root)
-            local pos = root.Position
-            local delta = goal - pos
-            local dist = delta.Magnitude
-            local step = speed * dt
-
-            if dist <= step then
-                root.CFrame = goalCF or (CFrame.new(goal) * root.CFrame.Rotation)
+            if stepToward(mover, root, goal, speed, dt) then
+                if goalCF then root.CFrame = goalCF end
                 zeroVelocity(root)
                 return true, newHold(goal, root) -- ถึงแล้ว -> hold
             end
-
-            setPos(root, pos + delta / dist * step)
-            zeroVelocity(root)
         end,
     }
 
@@ -362,11 +381,13 @@ function Tween.trackTo(...)
 
     local speed = parseSpeed(opts.speed)
 
+    local mover = {}
     local st = {
         moving = true,
         owner = hrp,
         update = function(dt, _, _, root)
             -- อ่านตำแหน่งจริงของ subject ใหม่ทุกเฟรม
+            -- (ยอมรับ subject ที่ถูกย้ายไป container อื่น เช่น ReplicatedStorage; หลุดก็ต่อเมื่อถูก destroy)
             local target = resolvePart(subject)
             if not target or not target:IsDescendantOf(game) then
                 return false, newHold(root.Position, root)
@@ -375,18 +396,7 @@ function Tween.trackTo(...)
             local tp = target.Position
             if not validVector(tp) then return end -- ข้ามเฟรมนี้
 
-            local goal = tp + offset
-            local pos = root.Position
-            local delta = goal - pos
-            local dist = delta.Magnitude
-            local step = speed * dt
-
-            if dist <= step then
-                setPos(root, goal)
-            else
-                setPos(root, pos + delta / dist * step)
-            end
-            zeroVelocity(root)
+            stepToward(mover, root, tp + offset, speed, dt)
         end,
     }
 
